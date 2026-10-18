@@ -449,11 +449,15 @@ async function fetchJson(url) {
 async function lookupRating(login) {
     const normalized = normalizeChannel(login);
     if (config.activity.lookupUrl) {
-        const template = config.activity.lookupUrl;
-        const url = template.includes('{login}') ? template.replaceAll('{login}', encodeURIComponent(normalized)) : `${template}${template.includes('?') ? '&' : '?'}login=${encodeURIComponent(normalized)}&channel=all&period=1y`;
-        const body = await fetchJson(url);
-        const entry = body?.data?.item || body?.data || body;
-        if (Number.isFinite(Number(entry?.rank))) return { entry, exact: true };
+        try {
+            const template = config.activity.lookupUrl;
+            const url = template.includes('{login}') ? template.replaceAll('{login}', encodeURIComponent(normalized)) : `${template}${template.includes('?') ? '&' : '?'}login=${encodeURIComponent(normalized)}&channel=all&period=1y`;
+            const body = await fetchJson(url);
+            const entry = body?.data?.item || body?.data || body;
+            if (Number.isFinite(Number(entry?.rank))) return { entry, exact: true };
+        } catch (error) {
+            console.warn('[РЕЙТИНГ LOOKUP]', error.message, '— использую публичный топ');
+        }
     }
     if (!ratingCache.data || ratingCache.expiresAt <= Date.now()) {
         const body = await fetchJson(config.activity.publicRatingUrl);
