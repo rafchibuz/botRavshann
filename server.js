@@ -89,10 +89,17 @@ function migrateConfig() {
     config.globalChatDelayMs = int(config.globalChatDelayMs, 600, 0, 30000);
     config.globalTimerIntervalSeconds = int(config.globalTimerIntervalSeconds, 600, 10, 86400);
     config.activity ||= {};
+    config.activity.enabled = config.activity.enabled !== false;
+    config.activity.commands = [...new Set((Array.isArray(config.activity.commands) ? config.activity.commands : ['!актив', '!active']).map(normalizeCommand).filter(Boolean))].slice(0, 10);
+    if (!config.activity.commands.length) config.activity.commands = ['!актив'];
     config.activity.cooldownSeconds = int(config.activity.cooldownSeconds, 10, 1, 300);
-    config.activity.publicRatingUrl ||= 'https://www.ravshan.tv/api/rating?channel=all&period=1y';
+    config.activity.ratingChannel = ['all', 'ravshann', 'ravshanbtw'].includes(config.activity.ratingChannel) ? config.activity.ratingChannel : 'all';
+    config.activity.period = ['1d', '7d', '30d', '90d', '1y', 'last_stream', 'all'].includes(config.activity.period) ? config.activity.period : 'all';
+    config.activity.publicRatingUrl ||= 'https://www.ravshan.tv/api/rating';
     config.activity.lookupUrl ||= 'https://www.ravshan.tv/api/rating/lookup';
     config.activity.siteUrl ||= 'https://ravshan.tv';
+    config.activity.responseTemplate ||= '{user}, ваше место в рейтинге — #{rank}. Более подробная информация на сайте {site}';
+    config.activity.notFoundTemplate ||= '{user}, вас пока нет в рейтинге. Более подробная информация на сайте {site}';
     config.activity.cacheSeconds = int(config.activity.cacheSeconds, 60, 5, 3600);
 
     const primary = normalizeChannel(config.twitch.channel);
@@ -172,7 +179,19 @@ function configView(channel) {
             mode: 'moderator',
             expectedLogin: config.twitch.moderatorLogin
         },
-        activity: { cooldownSeconds: config.activity.cooldownSeconds, exactLookupConfigured: Boolean(config.activity.lookupUrl), siteUrl: config.activity.siteUrl }
+        activity: {
+            enabled: config.activity.enabled,
+            commands: config.activity.commands,
+            cooldownSeconds: config.activity.cooldownSeconds,
+            ratingChannel: config.activity.ratingChannel,
+            period: config.activity.period,
+            publicRatingUrl: config.activity.publicRatingUrl,
+            lookupUrl: config.activity.lookupUrl,
+            exactLookupConfigured: Boolean(config.activity.lookupUrl),
+            siteUrl: config.activity.siteUrl,
+            responseTemplate: config.activity.responseTemplate,
+            notFoundTemplate: config.activity.notFoundTemplate
+        }
     };
 }
 
@@ -441,12 +460,22 @@ async function fetchJson(url) {
     return response.json();
 }
 
+function ratingUrl(base, extra = {}) {
+    const url = new URL(base);
+    url.searchParams.set('channel', config.activity.ratingChannel);
+    url.searchParams.set('period', config.activity.period);
+    for (const [key, value] of Object.entries(extra)) url.searchParams.set(key, value);
+    return url.toString();
+}
+
 async function lookupRating(login) {
     const normalized = normalizeChannel(login);
     if (config.activity.lookupUrl) {
         try {
             const template = config.activity.lookupUrl;
-            const url = template.includes('{login}') ? template.replaceAll('{login}', encodeURIComponent(normalized)) : `${template}${template.includes('?') ? '&' : '?'}login=${encodeURIComponent(normalized)}&channel=all&period=1y`;
+            const url = template.includes('{login}')
+                ? ratingUrl(template.replaceAll('{login}', encodeURIComponent(normalized)))
+                : ratingUrl(template, { login: normalized });
             const body = await fetchJson(url);
             const entry = body?.data?.item || body?.data || body;
             if (Number.isFinite(Number(entry?.rank))) return { entry, exact: true };
@@ -455,7 +484,7 @@ async function lookupRating(login) {
         }
     }
     if (!ratingCache.data || ratingCache.expiresAt <= Date.now()) {
-        const body = await fetchJson(config.activity.publicRatingUrl);
+        const body = await fetchJson(ratingUrl(config.activity.publicRatingUrl));
         ratingCache = { data: body?.data || body, expiresAt: Date.now() + config.activity.cacheSeconds * 1000 };
     }
     const items = ratingCache.data?.items || [];
@@ -464,12 +493,16 @@ async function lookupRating(login) {
 
 async function activityReply(channel, tags) {
     const name = tags['display-name'] || tags.username;
+    const values = { user: `@${name}`, login: tags.username, site: config.activity.siteUrl.replace(/^https?:\/\//, '') };
+    const format = (template, extra = {}) => Object.entries({ ...values, ...extra }).reduce((text, [key, value]) => text.replaceAll(`{${key}}`, String(value)), template);
     let text;
     try {
         const result = await lookupRating(tags.username);
         text = result.entry
-            ? `@${name}, ваше место в рейтинге — #${result.entry.rank}. Более подробная информация на сайте ${config.activity.siteUrl.replace(/^https?:\/\//, '')}`
-            : `@${name}, точное место пока недоступно: публичный рейтинг показывает только топ-${result.limitedToTop || 100}. Более подробная информация на сайте ${config.activity.siteUrl.replace(/^https?:\/\//, '')}`;
+            ? format(config.activity.responseTemplate, { rank: result.entry.rank })
+            : result.limitedToTop
+                ? `${format(config.activity.notFoundTemplate)} (резервный источник: топ-${result.limitedToTop})`
+                : format(config.activity.notFoundTemplate);
     } catch (error) {
         console.error('[!АКТИВ]', error.message);
         text = `@${name}, сейчас не удалось получить рейтинг. Попробуйте позже.`;
@@ -526,6 +559,44 @@ app.use(requireAuth);
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 app.get('/get-config', (req, res) => { try { res.json(configView(req.query.channel)); } catch (error) { res.status(400).json({ message: error.message }); } });
 app.get('/get-channels', (req, res) => res.json(config.channels));
+app.put('/api/activity-settings', (req, res) => {
+    try {
+        const commands = [...new Set((Array.isArray(req.body.commands) ? req.body.commands : String(req.body.commands || '').split(',')).map(normalizeCommand).filter(Boolean))].slice(0, 10);
+        if (!commands.length) return res.status(400).json({ message: 'Добавьте хотя бы одну команду' });
+        const ratingChannel = cleanText(req.body.ratingChannel, 30).toLowerCase();
+        const period = cleanText(req.body.period, 20).toLowerCase();
+        if (!['all', 'ravshann', 'ravshanbtw'].includes(ratingChannel)) return res.status(400).json({ message: 'Неизвестный канал рейтинга' });
+        if (!['1d', '7d', '30d', '90d', '1y', 'last_stream', 'all'].includes(period)) return res.status(400).json({ message: 'Неизвестный период рейтинга' });
+        const publicRatingUrl = cleanText(req.body.publicRatingUrl, 500);
+        const lookupUrl = cleanText(req.body.lookupUrl, 500);
+        const siteUrl = cleanText(req.body.siteUrl, 500);
+        for (const value of [publicRatingUrl, lookupUrl, siteUrl]) {
+            const parsed = new URL(value);
+            if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Разрешены только HTTP/HTTPS URL');
+        }
+        const responseTemplate = cleanText(req.body.responseTemplate);
+        const notFoundTemplate = cleanText(req.body.notFoundTemplate);
+        if (!responseTemplate.includes('{rank}')) return res.status(400).json({ message: 'В шаблоне успешного ответа должна быть переменная {rank}' });
+        if (!responseTemplate || !notFoundTemplate) return res.status(400).json({ message: 'Шаблоны ответов не могут быть пустыми' });
+        Object.assign(config.activity, {
+            enabled: req.body.enabled !== false,
+            commands,
+            cooldownSeconds: int(req.body.cooldownSeconds, 10, 1, 300),
+            ratingChannel,
+            period,
+            publicRatingUrl,
+            lookupUrl,
+            siteUrl,
+            responseTemplate,
+            notFoundTemplate
+        });
+        ratingCache = { expiresAt: 0, data: null };
+        activityThrottle.forEach(item => item.timer && clearTimeout(item.timer));
+        activityThrottle.clear();
+        saveConfig();
+        res.json({ activity: configView(req.body.channel || config.twitch.channel).activity, message: 'Настройки !актив сохранены' });
+    } catch (error) { res.status(400).json({ message: error.message }); }
+});
 app.get('/auth/twitch/start', (req, res) => {
     if (!config.twitch.clientId || !config.twitch.clientSecret) return res.status(400).send('Сначала укажите Twitch Client ID и Client Secret');
     const channel = normalizeChannel(req.query.channel || config.twitch.channel);
@@ -691,7 +762,7 @@ client.on('message', async (channel, tags, message, self) => {
     if (self) { resolveMessageId(channel, tags, message); return; }
     if (!tags.username) return;
     const key = normalizeChannel(channel); const args = message.trim().toLowerCase().split(/\s+/); const command = args[0];
-    if (command === '!актив' || command === '!active') { queueActivityReply(channel, tags); return; }
+    if (config.activity.enabled && config.activity.commands.includes(normalizeCommand(command))) { queueActivityReply(channel, tags); return; }
     const mod = Boolean(tags.mod) || normalizeChannel(tags.username) === key; const state = getState(key);
     if (mod && command === '!таймер') {
         args.slice(1).forEach(token => { const timer = findTimer(state, token); if (timer) timer.enabled = true; }); saveConfig(); await client.say(channel, timerStatus(key)); return;

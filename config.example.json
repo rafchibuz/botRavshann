@@ -18,10 +18,16 @@
   "globalTimerIntervalSeconds": 600,
   "globalTimerEnabled": false,
   "activity": {
+    "enabled": true,
+    "commands": ["!актив", "!active"],
     "cooldownSeconds": 10,
-    "publicRatingUrl": "https://www.ravshan.tv/api/rating?channel=all&period=1y",
+    "ratingChannel": "all",
+    "period": "all",
+    "publicRatingUrl": "https://www.ravshan.tv/api/rating",
     "lookupUrl": "https://www.ravshan.tv/api/rating/lookup",
     "siteUrl": "https://ravshan.tv",
+    "responseTemplate": "{user}, ваше место в рейтинге — #{rank}. Более подробная информация на сайте {site}",
+    "notFoundTemplate": "{user}, вас пока нет в рейтинге. Более подробная информация на сайте {site}",
     "cacheSeconds": 60
   },
   "buttons": [],
