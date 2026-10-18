@@ -539,7 +539,8 @@ app.get('/get-stream-title', async (req, res) => {
     try {
         const channel = normalizeChannel(req.query.channel || config.twitch.channel);
         const body = await helix(`/channels?broadcaster_id=${encodeURIComponent(await twitchUserId(channel))}`);
-        res.json({ title: body?.data?.[0]?.title || 'Без названия' });
+        const info = body?.data?.[0] || {};
+        res.json({ title: info.title || 'Без названия', game: info.game_name || 'Без категории', gameId: info.game_id || null });
     } catch (error) { res.status(400).json({ message: error.message }); }
 });
 app.get('/get-pinned-message', async (req, res) => {
@@ -569,7 +570,6 @@ app.get('/get-pinned-message', async (req, res) => {
         });
     } catch (error) { res.status(400).json({ message: error.message }); }
 });
-app.post('/request-game-update', (req, res) => { client.say(toIrcChannel(req.body.channel), '!setgame'); res.json({ success: true }); });
 app.post('/send-set-title', async (req, res) => {
     const title = cleanText(req.body.titleText, 140);
     if (!title) return res.status(400).json({ message: 'Название не может быть пустым' });
@@ -579,7 +579,19 @@ app.post('/send-set-title', async (req, res) => {
         res.json({ success: true, title, message: `Название #${channel} изменено` });
     } catch (error) { res.status(400).json({ message: error.message }); }
 });
-app.post('/send-set-game', (req, res) => { client.say(toIrcChannel(req.body.channel), `!setgame ${cleanText(req.body.gameText, 80)}`); res.json({ success: true }); });
+app.post('/send-set-game', async (req, res) => {
+    const query = cleanText(req.body.gameText, 80);
+    if (!query) return res.status(400).json({ message: 'Введите название категории' });
+    try {
+        const search = await helix(`/search/categories?query=${encodeURIComponent(query)}&first=20`);
+        const categories = search?.data || [];
+        const category = categories.find(item => item.name.toLowerCase() === query.toLowerCase()) || categories[0];
+        if (!category) return res.status(404).json({ message: `Категория «${query}» не найдена в Twitch` });
+        const channel = normalizeChannel(req.body.channel || config.twitch.channel);
+        await helix(`/channels?broadcaster_id=${encodeURIComponent(await twitchUserId(channel))}`, { method: 'PATCH', body: JSON.stringify({ game_id: category.id }) });
+        res.json({ success: true, game: category.name, gameId: category.id, message: `Категория #${channel} изменена на «${category.name}»` });
+    } catch (error) { res.status(400).json({ message: error.message }); }
+});
 
 client.on('message', async (channel, tags, message, self) => {
     if (self) { resolveMessageId(channel, tags, message); return; }
