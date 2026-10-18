@@ -24,6 +24,7 @@ const timerInstances = new Map();
 const busyChannels = new Set();
 const pendingOutgoing = new Map();
 const activityThrottle = new Map();
+const commandCooldowns = new Map();
 const twitchUserIds = new Map();
 const oauthStates = new Map();
 let ratingCache = { expiresAt: 0, data: null };
@@ -33,6 +34,10 @@ const normalizeChannel = value => String(value || '').replace(/^#/, '').trim().t
 const toIrcChannel = value => `#${normalizeChannel(value)}`;
 const cleanText = (value, max = 500) => String(value || '').trim().slice(0, max);
 const makeId = prefix => `${prefix}_${crypto.randomUUID()}`;
+function normalizeCommand(value) {
+    const command = String(value || '').trim().toLowerCase().replace(/^!+/, '').replace(/[^a-zа-яё0-9_]+/gi, '');
+    return command ? `!${command.slice(0, 40)}` : '';
+}
 
 function int(value, fallback, min, max) {
     const parsed = Number.parseInt(value, 10);
@@ -69,6 +74,7 @@ function defaultChannelState() {
         queueIndex: 0,
         timers: legacyTimers(),
         pinnedMessages: [],
+        customCommands: [],
         currentPinnedMessageId: null
     };
 }
@@ -76,19 +82,23 @@ function defaultChannelState() {
 function migrateConfig() {
     config.twitch ||= {};
     config.twitch.redirectUri ||= 'http://localhost:8080';
-    config.twitch.oauthScopes ||= [
+    config.twitch.channelAuth ||= {};
+    const requiredScopes = [
         'chat:read',
         'chat:edit',
         'moderator:manage:chat_messages',
-        'channel:manage:broadcast'
+        'channel:manage:broadcast',
+        'channel:manage:polls',
+        'channel:manage:predictions'
     ];
+    config.twitch.oauthScopes = [...new Set([...(config.twitch.oauthScopes || []), ...requiredScopes])];
     config.panelPassword ||= 'change-me';
     config.globalChatDelayMs = int(config.globalChatDelayMs, 600, 0, 30000);
     config.globalTimerIntervalSeconds = int(config.globalTimerIntervalSeconds, 600, 10, 86400);
     config.activity ||= {};
     config.activity.cooldownSeconds = int(config.activity.cooldownSeconds, 10, 1, 300);
     config.activity.publicRatingUrl ||= 'https://www.ravshan.tv/api/rating?channel=all&period=1y';
-    config.activity.lookupUrl ||= '';
+    config.activity.lookupUrl ||= 'https://www.ravshan.tv/api/rating/lookup';
     config.activity.siteUrl ||= 'https://ravshan.tv';
     config.activity.cacheSeconds = int(config.activity.cacheSeconds, 60, 5, 3600);
 
@@ -123,6 +133,14 @@ function migrateConfig() {
             message: cleanText(pin.message),
             durationSeconds: int(pin.durationSeconds, 300, 30, 1800)
         })).filter(pin => pin.message);
+        state.customCommands = (Array.isArray(state.customCommands) ? state.customCommands : []).map(command => ({
+            id: String(command.id || makeId('command')),
+            command: normalizeCommand(command.command),
+            response: cleanText(command.response),
+            cooldownSeconds: int(command.cooldownSeconds, 10, 0, 3600),
+            permission: ['everyone', 'vip', 'mod'].includes(command.permission) ? command.permission : 'everyone',
+            enabled: command.enabled !== false
+        })).filter(command => command.command && command.response);
         delete state.buttons;
     }
     saveConfig();
@@ -141,6 +159,7 @@ function quickMessages() {
 function configView(channel) {
     const key = normalizeChannel(channel || config.twitch.channel);
     const state = getState(key);
+    const channelAuth = config.twitch.channelAuth[key] || {};
     return {
         channels: config.channels,
         activeChannel: key,
@@ -150,11 +169,13 @@ function configView(channel) {
         buttons: quickMessages(),
         timers: state.timers,
         pinnedMessages: state.pinnedMessages,
-        pinningConfigured: Boolean(config.twitch.clientId && config.twitch.oauthToken),
+        customCommands: state.customCommands,
+        pinningConfigured: Boolean(config.twitch.clientId && channelAuth.refreshToken),
         twitchAuth: {
             appConfigured: Boolean(config.twitch.clientId && config.twitch.clientSecret),
-            authorized: Boolean(config.twitch.refreshToken),
-            expiresAt: config.twitch.tokenExpiresAt || null
+            authorized: Boolean(channelAuth.refreshToken),
+            login: channelAuth.login || null,
+            expiresAt: channelAuth.expiresAt || null
         },
         activity: { cooldownSeconds: config.activity.cooldownSeconds, exactLookupConfigured: Boolean(config.activity.lookupUrl), siteUrl: config.activity.siteUrl }
     };
@@ -237,38 +258,85 @@ function findTimer(state, token) {
     return state.timers.find(timer => timer.id === (aliases[value] || value) || timer.title.toLowerCase() === value);
 }
 
-function bearer() { return String(config.twitch.oauthToken || '').replace(/^oauth:/i, ''); }
+const reservedCommands = new Set(['!актив', '!active', '!пинг', '!ping', '!таймер', '!таймерофф', '!таймероф', '!таймеры']);
+function validateCustomCommand(body, existingId, channel) {
+    const command = normalizeCommand(body.command);
+    const response = cleanText(body.response);
+    if (!command) throw new Error('Введите команду, например !сайт');
+    if (reservedCommands.has(command)) throw new Error('Эта команда встроена в бота и не может быть заменена');
+    if (!response) throw new Error('Введите текст ответа');
+    const state = getState(channel);
+    if (state.customCommands.some(item => item.id !== existingId && item.command === command)) throw new Error('Такая команда уже существует');
+    return {
+        command,
+        response,
+        cooldownSeconds: int(body.cooldownSeconds, 10, 0, 3600),
+        permission: ['everyone', 'vip', 'mod'].includes(body.permission) ? body.permission : 'everyone',
+        enabled: body.enabled !== false
+    };
+}
 
-async function refreshAccessToken() {
-    if (!config.twitch.refreshToken || !config.twitch.clientSecret) {
+function canUseCustomCommand(tags, permission, channel) {
+    const isBroadcaster = normalizeChannel(tags.username) === normalizeChannel(channel);
+    const isMod = Boolean(tags.mod) || isBroadcaster;
+    return permission === 'everyone' || (permission === 'vip' && (isMod || Boolean(tags.vip) || Boolean(tags.badges?.vip))) || (permission === 'mod' && isMod);
+}
+
+async function runCustomCommand(channel, tags, definition) {
+    const key = normalizeChannel(channel);
+    if (!canUseCustomCommand(tags, definition.permission, key)) return;
+    const cooldownKey = `${key}:${definition.id}`;
+    const lastUsedAt = commandCooldowns.get(cooldownKey) || 0;
+    if (Date.now() - lastUsedAt < definition.cooldownSeconds * 1000) return;
+    commandCooldowns.set(cooldownKey, Date.now());
+    const displayName = tags['display-name'] || tags.username;
+    const response = definition.response
+        .replaceAll('{user}', `@${displayName}`)
+        .replaceAll('{login}', tags.username)
+        .replaceAll('{channel}', key);
+    if (typeof client.reply === 'function' && tags.id) await client.reply(channel, response, tags.id);
+    else await client.say(channel, response);
+}
+
+function getChannelAuth(channel) {
+    const key = normalizeChannel(channel || config.twitch.channel);
+    return config.twitch.channelAuth[key] ||= {};
+}
+
+async function refreshAccessToken(channel) {
+    const key = normalizeChannel(channel || config.twitch.channel);
+    const auth = getChannelAuth(key);
+    if (!auth.refreshToken || !config.twitch.clientSecret) {
         throw new Error('Подключите Twitch в панели управления');
     }
     const form = new URLSearchParams({
         client_id: config.twitch.clientId,
         client_secret: config.twitch.clientSecret,
         grant_type: 'refresh_token',
-        refresh_token: config.twitch.refreshToken
+        refresh_token: auth.refreshToken
     });
     const response = await fetch('https://id.twitch.tv/oauth2/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: form });
     const body = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(body.message || `Не удалось обновить Twitch OAuth: HTTP ${response.status}`);
-    config.twitch.oauthToken = `oauth:${body.access_token}`;
-    config.twitch.refreshToken = body.refresh_token || config.twitch.refreshToken;
-    config.twitch.tokenExpiresAt = Date.now() + Number(body.expires_in || 0) * 1000;
+    auth.accessToken = body.access_token;
+    auth.refreshToken = body.refresh_token || auth.refreshToken;
+    auth.expiresAt = Date.now() + Number(body.expires_in || 0) * 1000;
+    auth.scopes = body.scope || auth.scopes || [];
     saveConfig();
-    client.opts.identity.password = config.twitch.oauthToken;
     return body.access_token;
 }
 
-async function validBearer() {
-    if (config.twitch.refreshToken && (!config.twitch.tokenExpiresAt || config.twitch.tokenExpiresAt < Date.now() + 300000)) {
-        return refreshAccessToken();
+async function validBearer(channel) {
+    const auth = getChannelAuth(channel);
+    if (auth.refreshToken && (!auth.expiresAt || auth.expiresAt < Date.now() + 300000)) {
+        return refreshAccessToken(channel);
     }
-    if (!bearer()) throw new Error('Twitch OAuth не подключён');
-    return bearer();
+    if (!auth.accessToken) throw new Error('Подключите аккаунт владельца канала в панели');
+    return auth.accessToken;
 }
 
-async function exchangeAuthorizationCode(code) {
+async function exchangeAuthorizationCode(code, channel) {
+    const key = normalizeChannel(channel);
     const form = new URLSearchParams({
         client_id: config.twitch.clientId,
         client_secret: config.twitch.clientSecret,
@@ -279,17 +347,26 @@ async function exchangeAuthorizationCode(code) {
     const response = await fetch('https://id.twitch.tv/oauth2/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: form });
     const body = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(body.message || `Twitch OAuth: HTTP ${response.status}`);
-    config.twitch.oauthToken = `oauth:${body.access_token}`;
-    config.twitch.refreshToken = body.refresh_token;
-    config.twitch.tokenExpiresAt = Date.now() + Number(body.expires_in || 0) * 1000;
-    config.twitch.oauthScopes = body.scope || config.twitch.oauthScopes;
+    const validationResponse = await fetch('https://id.twitch.tv/oauth2/validate', { headers: { Authorization: `OAuth ${body.access_token}` } });
+    const validation = await validationResponse.json().catch(() => ({}));
+    if (!validationResponse.ok) throw new Error(validation.message || 'Не удалось проверить Twitch OAuth');
+    if (normalizeChannel(validation.login) !== key) {
+        throw new Error(`Войдите в Twitch как ${key}, сейчас выбран аккаунт ${validation.login || 'неизвестен'}`);
+    }
+    config.twitch.channelAuth[key] = {
+        accessToken: body.access_token,
+        refreshToken: body.refresh_token,
+        expiresAt: Date.now() + Number(body.expires_in || 0) * 1000,
+        scopes: body.scope || [],
+        userId: validation.user_id,
+        login: normalizeChannel(validation.login)
+    };
     saveConfig();
-    client.opts.identity.password = config.twitch.oauthToken;
 }
 
-async function helix(url, options = {}) {
+async function helix(url, options = {}, authChannel = config.twitch.channel) {
     if (!config.twitch.clientId) throw new Error('В config.json не указан twitch.clientId');
-    const accessToken = await validBearer();
+    const accessToken = await validBearer(authChannel);
     const response = await fetch(`https://api.twitch.tv/helix${url}`, {
         ...options,
         headers: { Authorization: `Bearer ${accessToken}`, 'Client-Id': config.twitch.clientId, 'Content-Type': 'application/json', ...(options.headers || {}) }
@@ -300,14 +377,20 @@ async function helix(url, options = {}) {
     return body;
 }
 
-async function twitchUserId(login) {
+async function twitchUserId(login, authChannel = config.twitch.channel) {
     const key = normalizeChannel(login);
     if (twitchUserIds.has(key)) return twitchUserIds.get(key);
-    const body = await helix(`/users?login=${encodeURIComponent(key)}`);
+    const body = await helix(`/users?login=${encodeURIComponent(key)}`, {}, authChannel);
     const id = body?.data?.[0]?.id;
     if (!id) throw new Error(`Twitch-пользователь ${key} не найден`);
     twitchUserIds.set(key, id);
     return id;
+}
+
+function channelAuthUserId(channel) {
+    const auth = getChannelAuth(channel);
+    if (!auth.userId) throw new Error('Переподключите Twitch-аккаунт владельца выбранного канала');
+    return auth.userId;
 }
 
 function waitMessageId(channel, message) {
@@ -339,10 +422,10 @@ async function sendAndPin(channel, message, durationSeconds) {
     await client.say(toIrcChannel(key), message);
     const messageId = await idPromise;
     const params = new URLSearchParams({
-        broadcaster_id: await twitchUserId(key), moderator_id: await twitchUserId(config.twitch.botUsername),
+        broadcaster_id: await twitchUserId(key, key), moderator_id: channelAuthUserId(key),
         message_id: messageId, duration_seconds: String(int(durationSeconds, 300, 30, 1800))
     });
-    await helix(`/chat/pins?${params}`, { method: 'PUT' });
+    await helix(`/chat/pins?${params}`, { method: 'PUT' }, key);
     getState(key).currentPinnedMessageId = messageId;
     saveConfig();
 }
@@ -351,8 +434,8 @@ async function unpin(channel) {
     const key = normalizeChannel(channel);
     const state = getState(key);
     if (!state.currentPinnedMessageId) throw new Error('У бота нет ID текущего закрепа');
-    const params = new URLSearchParams({ broadcaster_id: await twitchUserId(key), moderator_id: await twitchUserId(config.twitch.botUsername), message_id: state.currentPinnedMessageId });
-    await helix(`/chat/pins?${params}`, { method: 'DELETE' });
+    const params = new URLSearchParams({ broadcaster_id: await twitchUserId(key, key), moderator_id: channelAuthUserId(key), message_id: state.currentPinnedMessageId });
+    await helix(`/chat/pins?${params}`, { method: 'DELETE' }, key);
     state.currentPinnedMessageId = null;
     saveConfig();
 }
@@ -421,11 +504,11 @@ app.get('/', async (req, res, next) => {
     if (!req.query.code && !req.query.error) return next();
     const pending = oauthStates.get(String(req.query.state || ''));
     oauthStates.delete(String(req.query.state || ''));
-    if (!pending || pending < Date.now()) return res.status(400).send('OAuth state истёк. Вернитесь в панель и подключите Twitch заново.');
+    if (!pending || pending.expiresAt < Date.now()) return res.status(400).send('OAuth state истёк. Вернитесь в панель и подключите Twitch заново.');
     if (req.query.error) return res.status(400).send(`Twitch OAuth отклонён: ${cleanText(req.query.error_description || req.query.error, 300)}`);
     try {
-        await exchangeAuthorizationCode(String(req.query.code));
-        return res.redirect('/?twitch=connected');
+        await exchangeAuthorizationCode(String(req.query.code), pending.channel);
+        return res.redirect(`/?twitch=connected&channel=${encodeURIComponent(pending.channel)}`);
     } catch (error) {
         return res.status(400).send(`Ошибка Twitch OAuth: ${cleanText(error.message, 300)}`);
     }
@@ -446,8 +529,10 @@ app.get('/get-config', (req, res) => { try { res.json(configView(req.query.chann
 app.get('/get-channels', (req, res) => res.json(config.channels));
 app.get('/auth/twitch/start', (req, res) => {
     if (!config.twitch.clientId || !config.twitch.clientSecret) return res.status(400).send('Сначала укажите Twitch Client ID и Client Secret');
+    const channel = normalizeChannel(req.query.channel || config.twitch.channel);
+    if (!config.channels.includes(channel)) return res.status(400).send('Неизвестный канал');
     const state = crypto.randomBytes(24).toString('hex');
-    oauthStates.set(state, Date.now() + 10 * 60 * 1000);
+    oauthStates.set(state, { expiresAt: Date.now() + 10 * 60 * 1000, channel });
     const params = new URLSearchParams({
         client_id: config.twitch.clientId,
         redirect_uri: config.twitch.redirectUri,
@@ -499,6 +584,33 @@ app.post('/api/timers/:id/send', async (req, res) => {
     catch (error) { res.status(409).json({ message: error.message }); }
 });
 
+app.post('/api/commands', (req, res) => {
+    try {
+        const channel = normalizeChannel(req.body.channel || config.twitch.channel);
+        const state = getState(channel);
+        const command = { id: makeId('command'), ...validateCustomCommand(req.body, null, channel) };
+        state.customCommands.push(command); saveConfig(); res.status(201).json({ command });
+    } catch (error) { res.status(400).json({ message: error.message }); }
+});
+app.put('/api/commands/:id', (req, res) => {
+    try {
+        const channel = normalizeChannel(req.body.channel || config.twitch.channel);
+        const state = getState(channel); const command = state.customCommands.find(item => item.id === req.params.id);
+        if (!command) return res.status(404).json({ message: 'Команда не найдена' });
+        Object.assign(command, validateCustomCommand({ ...command, ...req.body }, command.id, channel));
+        saveConfig(); res.json({ command });
+    } catch (error) { res.status(400).json({ message: error.message }); }
+});
+app.delete('/api/commands/:id', (req, res) => {
+    try {
+        const state = getState(req.query.channel || config.twitch.channel); const before = state.customCommands.length;
+        state.customCommands = state.customCommands.filter(item => item.id !== req.params.id);
+        if (state.customCommands.length === before) return res.status(404).json({ message: 'Команда не найдена' });
+        commandCooldowns.forEach((_value, key) => { if (key.endsWith(`:${req.params.id}`)) commandCooldowns.delete(key); });
+        saveConfig(); res.json({ success: true });
+    } catch (error) { res.status(400).json({ message: error.message }); }
+});
+
 app.post('/api/pins', (req, res) => {
     const state = getState(req.body.channel || config.twitch.channel); const message = cleanText(req.body.message);
     if (!message) return res.status(400).json({ message: 'Введите текст закрепа' });
@@ -538,7 +650,7 @@ app.post('/start-custom-spam', async (req, res) => {
 app.get('/get-stream-title', async (req, res) => {
     try {
         const channel = normalizeChannel(req.query.channel || config.twitch.channel);
-        const body = await helix(`/channels?broadcaster_id=${encodeURIComponent(await twitchUserId(channel))}`);
+        const body = await helix(`/channels?broadcaster_id=${encodeURIComponent(await twitchUserId(channel, channel))}`, {}, channel);
         const info = body?.data?.[0] || {};
         res.json({ title: info.title || 'Без названия', game: info.game_name || 'Без категории', gameId: info.game_id || null });
     } catch (error) { res.status(400).json({ message: error.message }); }
@@ -547,10 +659,10 @@ app.get('/get-pinned-message', async (req, res) => {
     try {
         const channel = normalizeChannel(req.query.channel || config.twitch.channel);
         const params = new URLSearchParams({
-            broadcaster_id: await twitchUserId(channel),
-            moderator_id: await twitchUserId(config.twitch.botUsername)
+            broadcaster_id: await twitchUserId(channel, channel),
+            moderator_id: channelAuthUserId(channel)
         });
-        const body = await helix(`/chat/pins?${params}`);
+        const body = await helix(`/chat/pins?${params}`, {}, channel);
         const pinned = body?.data?.[0] || null;
         const state = getState(channel);
         const messageId = pinned?.message_id || null;
@@ -575,7 +687,7 @@ app.post('/send-set-title', async (req, res) => {
     if (!title) return res.status(400).json({ message: 'Название не может быть пустым' });
     try {
         const channel = normalizeChannel(req.body.channel || config.twitch.channel);
-        await helix(`/channels?broadcaster_id=${encodeURIComponent(await twitchUserId(channel))}`, { method: 'PATCH', body: JSON.stringify({ title }) });
+        await helix(`/channels?broadcaster_id=${encodeURIComponent(await twitchUserId(channel, channel))}`, { method: 'PATCH', body: JSON.stringify({ title }) }, channel);
         res.json({ success: true, title, message: `Название #${channel} изменено` });
     } catch (error) { res.status(400).json({ message: error.message }); }
 });
@@ -583,13 +695,44 @@ app.post('/send-set-game', async (req, res) => {
     const query = cleanText(req.body.gameText, 80);
     if (!query) return res.status(400).json({ message: 'Введите название категории' });
     try {
-        const search = await helix(`/search/categories?query=${encodeURIComponent(query)}&first=20`);
+        const channel = normalizeChannel(req.body.channel || config.twitch.channel);
+        const search = await helix(`/search/categories?query=${encodeURIComponent(query)}&first=20`, {}, channel);
         const categories = search?.data || [];
         const category = categories.find(item => item.name.toLowerCase() === query.toLowerCase()) || categories[0];
         if (!category) return res.status(404).json({ message: `Категория «${query}» не найдена в Twitch` });
-        const channel = normalizeChannel(req.body.channel || config.twitch.channel);
-        await helix(`/channels?broadcaster_id=${encodeURIComponent(await twitchUserId(channel))}`, { method: 'PATCH', body: JSON.stringify({ game_id: category.id }) });
+        await helix(`/channels?broadcaster_id=${encodeURIComponent(await twitchUserId(channel, channel))}`, { method: 'PATCH', body: JSON.stringify({ game_id: category.id }) }, channel);
         res.json({ success: true, game: category.name, gameId: category.id, message: `Категория #${channel} изменена на «${category.name}»` });
+    } catch (error) { res.status(400).json({ message: error.message }); }
+});
+
+function stringChoices(values, min, max) {
+    const choices = (Array.isArray(values) ? values : []).map(value => cleanText(value, 25)).filter(Boolean);
+    if (choices.length < min || choices.length > max) throw new Error(`Нужно от ${min} до ${max} вариантов`);
+    if (new Set(choices.map(value => value.toLowerCase())).size !== choices.length) throw new Error('Варианты не должны повторяться');
+    return choices;
+}
+
+app.post('/api/polls', async (req, res) => {
+    try {
+        const channel = normalizeChannel(req.body.channel || config.twitch.channel);
+        const title = cleanText(req.body.title, 60);
+        if (!title) return res.status(400).json({ message: 'Введите вопрос опроса' });
+        const choices = stringChoices(req.body.choices, 2, 5).map(title => ({ title }));
+        const duration = int(req.body.duration, 60, 15, 1800);
+        const body = await helix('/polls', { method: 'POST', body: JSON.stringify({ broadcaster_id: await twitchUserId(channel, channel), title, choices, duration }) }, channel);
+        res.status(201).json({ poll: body?.data?.[0], message: `Опрос «${title}» создан` });
+    } catch (error) { res.status(400).json({ message: error.message }); }
+});
+
+app.post('/api/predictions', async (req, res) => {
+    try {
+        const channel = normalizeChannel(req.body.channel || config.twitch.channel);
+        const title = cleanText(req.body.title, 45);
+        if (!title) return res.status(400).json({ message: 'Введите вопрос прогноза' });
+        const outcomes = stringChoices(req.body.outcomes, 2, 10).map(title => ({ title }));
+        const prediction_window = int(req.body.predictionWindow, 60, 30, 1800);
+        const body = await helix('/predictions', { method: 'POST', body: JSON.stringify({ broadcaster_id: await twitchUserId(channel, channel), title, outcomes, prediction_window }) }, channel);
+        res.status(201).json({ prediction: body?.data?.[0], message: `Прогноз «${title}» создан` });
     } catch (error) { res.status(400).json({ message: error.message }); }
 });
 
@@ -614,6 +757,11 @@ client.on('message', async (channel, tags, message, self) => {
     }
     if (command === '!пинг' || command === '!ping') {
         const seconds = Math.floor((Date.now() - startTime) / 1000); await client.say(channel, `Понг! 🏓 Аптайм: ${Math.floor(seconds / 3600)}ч ${Math.floor(seconds % 3600 / 60)}м ${seconds % 60}с`); return;
+    }
+    const customCommand = state.customCommands.find(item => item.enabled && item.command === normalizeCommand(command));
+    if (customCommand) {
+        try { await runCustomCommand(channel, tags, customCommand); } catch (error) { console.error('[КОМАНДА]', error.message); }
+        return;
     }
     const aliases = { '!тг': 'tg', '!гта': 'majestic', '!бб': 'betboom', '!фоллоу': 'follow', '!ф': 'follow', '!розыгрыш': 'priora', '!приора': 'priora', '!роз': 'priora', '!общага': 'obshaga', '!отг': 'obshaga', '!инт': 'int' };
     const target = quickMessages().find(button => button.id === aliases[command]);

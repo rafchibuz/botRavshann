@@ -6,13 +6,14 @@
     "clientId": "your_twitch_application_client_id",
     "clientSecret": "your_twitch_application_client_secret",
     "redirectUri": "http://localhost:8080",
-    "refreshToken": "",
-    "tokenExpiresAt": 0,
+    "channelAuth": {},
     "oauthScopes": [
       "chat:read",
       "chat:edit",
       "moderator:manage:chat_messages",
-      "channel:manage:broadcast"
+      "channel:manage:broadcast",
+      "channel:manage:polls",
+      "channel:manage:predictions"
     ]
   },
   "channels": ["ravshann", "ravshanbtw"],
@@ -23,7 +24,7 @@
   "activity": {
     "cooldownSeconds": 10,
     "publicRatingUrl": "https://www.ravshan.tv/api/rating?channel=all&period=1y",
-    "lookupUrl": "",
+    "lookupUrl": "https://www.ravshan.tv/api/rating/lookup",
     "siteUrl": "https://ravshan.tv",
     "cacheSeconds": 60
   },
