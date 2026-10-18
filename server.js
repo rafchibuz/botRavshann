@@ -542,6 +542,33 @@ app.get('/get-stream-title', async (req, res) => {
         res.json({ title: body?.data?.[0]?.title || 'Без названия' });
     } catch (error) { res.status(400).json({ message: error.message }); }
 });
+app.get('/get-pinned-message', async (req, res) => {
+    try {
+        const channel = normalizeChannel(req.query.channel || config.twitch.channel);
+        const params = new URLSearchParams({
+            broadcaster_id: await twitchUserId(channel),
+            moderator_id: await twitchUserId(config.twitch.botUsername)
+        });
+        const body = await helix(`/chat/pins?${params}`);
+        const pinned = body?.data?.[0] || null;
+        const state = getState(channel);
+        const messageId = pinned?.message_id || null;
+        if (state.currentPinnedMessageId !== messageId) {
+            state.currentPinnedMessageId = messageId;
+            saveConfig();
+        }
+        res.json({
+            pinned: Boolean(pinned),
+            messageId,
+            text: pinned?.message?.text || '',
+            sender: pinned?.sender_user_name || pinned?.sender_user_login || '',
+            pinnedBy: pinned?.pinned_by_user_name || pinned?.pinned_by_user_login || '',
+            startsAt: pinned?.starts_at || null,
+            endsAt: pinned?.ends_at || null,
+            updatedAt: pinned?.updated_at || null
+        });
+    } catch (error) { res.status(400).json({ message: error.message }); }
+});
 app.post('/request-game-update', (req, res) => { client.say(toIrcChannel(req.body.channel), '!setgame'); res.json({ success: true }); });
 app.post('/send-set-title', async (req, res) => {
     const title = cleanText(req.body.titleText, 140);
