@@ -3,7 +3,17 @@
     "channel": "ravshann",
     "botUsername": "your_bot_login",
     "oauthToken": "oauth:your_user_access_token",
-    "clientId": "your_twitch_application_client_id"
+    "clientId": "your_twitch_application_client_id",
+    "clientSecret": "your_twitch_application_client_secret",
+    "redirectUri": "http://localhost:8080",
+    "refreshToken": "",
+    "tokenExpiresAt": 0,
+    "oauthScopes": [
+      "chat:read",
+      "chat:edit",
+      "moderator:manage:chat_messages",
+      "channel:manage:broadcast"
+    ]
   },
   "channels": ["ravshann", "ravshanbtw"],
   "panelPassword": "change-this-password",

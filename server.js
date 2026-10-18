@@ -25,6 +25,7 @@ const busyChannels = new Set();
 const pendingOutgoing = new Map();
 const activityThrottle = new Map();
 const twitchUserIds = new Map();
+const oauthStates = new Map();
 let ratingCache = { expiresAt: 0, data: null };
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -74,6 +75,13 @@ function defaultChannelState() {
 
 function migrateConfig() {
     config.twitch ||= {};
+    config.twitch.redirectUri ||= 'http://localhost:8080';
+    config.twitch.oauthScopes ||= [
+        'chat:read',
+        'chat:edit',
+        'moderator:manage:chat_messages',
+        'channel:manage:broadcast'
+    ];
     config.panelPassword ||= 'change-me';
     config.globalChatDelayMs = int(config.globalChatDelayMs, 600, 0, 30000);
     config.globalTimerIntervalSeconds = int(config.globalTimerIntervalSeconds, 600, 10, 86400);
@@ -143,6 +151,11 @@ function configView(channel) {
         timers: state.timers,
         pinnedMessages: state.pinnedMessages,
         pinningConfigured: Boolean(config.twitch.clientId && config.twitch.oauthToken),
+        twitchAuth: {
+            appConfigured: Boolean(config.twitch.clientId && config.twitch.clientSecret),
+            authorized: Boolean(config.twitch.refreshToken),
+            expiresAt: config.twitch.tokenExpiresAt || null
+        },
         activity: { cooldownSeconds: config.activity.cooldownSeconds, exactLookupConfigured: Boolean(config.activity.lookupUrl), siteUrl: config.activity.siteUrl }
     };
 }
@@ -226,11 +239,60 @@ function findTimer(state, token) {
 
 function bearer() { return String(config.twitch.oauthToken || '').replace(/^oauth:/i, ''); }
 
+async function refreshAccessToken() {
+    if (!config.twitch.refreshToken || !config.twitch.clientSecret) {
+        throw new Error('Подключите Twitch в панели управления');
+    }
+    const form = new URLSearchParams({
+        client_id: config.twitch.clientId,
+        client_secret: config.twitch.clientSecret,
+        grant_type: 'refresh_token',
+        refresh_token: config.twitch.refreshToken
+    });
+    const response = await fetch('https://id.twitch.tv/oauth2/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: form });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.message || `Не удалось обновить Twitch OAuth: HTTP ${response.status}`);
+    config.twitch.oauthToken = `oauth:${body.access_token}`;
+    config.twitch.refreshToken = body.refresh_token || config.twitch.refreshToken;
+    config.twitch.tokenExpiresAt = Date.now() + Number(body.expires_in || 0) * 1000;
+    saveConfig();
+    client.opts.identity.password = config.twitch.oauthToken;
+    return body.access_token;
+}
+
+async function validBearer() {
+    if (config.twitch.refreshToken && (!config.twitch.tokenExpiresAt || config.twitch.tokenExpiresAt < Date.now() + 300000)) {
+        return refreshAccessToken();
+    }
+    if (!bearer()) throw new Error('Twitch OAuth не подключён');
+    return bearer();
+}
+
+async function exchangeAuthorizationCode(code) {
+    const form = new URLSearchParams({
+        client_id: config.twitch.clientId,
+        client_secret: config.twitch.clientSecret,
+        code,
+        grant_type: 'authorization_code',
+        redirect_uri: config.twitch.redirectUri
+    });
+    const response = await fetch('https://id.twitch.tv/oauth2/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: form });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.message || `Twitch OAuth: HTTP ${response.status}`);
+    config.twitch.oauthToken = `oauth:${body.access_token}`;
+    config.twitch.refreshToken = body.refresh_token;
+    config.twitch.tokenExpiresAt = Date.now() + Number(body.expires_in || 0) * 1000;
+    config.twitch.oauthScopes = body.scope || config.twitch.oauthScopes;
+    saveConfig();
+    client.opts.identity.password = config.twitch.oauthToken;
+}
+
 async function helix(url, options = {}) {
     if (!config.twitch.clientId) throw new Error('В config.json не указан twitch.clientId');
+    const accessToken = await validBearer();
     const response = await fetch(`https://api.twitch.tv/helix${url}`, {
         ...options,
-        headers: { Authorization: `Bearer ${bearer()}`, 'Client-Id': config.twitch.clientId, 'Content-Type': 'application/json', ...(options.headers || {}) }
+        headers: { Authorization: `Bearer ${accessToken}`, 'Client-Id': config.twitch.clientId, 'Content-Type': 'application/json', ...(options.headers || {}) }
     });
     if (response.status === 204) return null;
     const body = await response.json().catch(() => ({}));
@@ -355,12 +417,25 @@ function queueActivityReply(channel, tags) {
 }
 
 app.use(express.json({ limit: '100kb' }));
+app.get('/', async (req, res, next) => {
+    if (!req.query.code && !req.query.error) return next();
+    const pending = oauthStates.get(String(req.query.state || ''));
+    oauthStates.delete(String(req.query.state || ''));
+    if (!pending || pending < Date.now()) return res.status(400).send('OAuth state истёк. Вернитесь в панель и подключите Twitch заново.');
+    if (req.query.error) return res.status(400).send(`Twitch OAuth отклонён: ${cleanText(req.query.error_description || req.query.error, 300)}`);
+    try {
+        await exchangeAuthorizationCode(String(req.query.code));
+        return res.redirect('/?twitch=connected');
+    } catch (error) {
+        return res.status(400).send(`Ошибка Twitch OAuth: ${cleanText(error.message, 300)}`);
+    }
+});
 app.get('/login', (req, res) => validSession(parseCookies(req)[SESSION_COOKIE]) ? res.redirect('/') : res.sendFile(path.join(__dirname, 'login.html')));
 app.post('/login', (req, res) => {
     if (!checkPassword(req.body.password)) return res.status(401).json({ message: 'Неверный пароль' });
     const token = crypto.randomBytes(32).toString('hex');
     sessions.set(token, Date.now() + SESSION_TTL_MS);
-    res.setHeader('Set-Cookie', `${SESSION_COOKIE}=${token}; HttpOnly; Path=/; Max-Age=${SESSION_TTL_MS / 1000}; SameSite=Strict`);
+    res.setHeader('Set-Cookie', `${SESSION_COOKIE}=${token}; HttpOnly; Path=/; Max-Age=${SESSION_TTL_MS / 1000}; SameSite=Lax`);
     res.json({ success: true });
 });
 app.post('/logout', (req, res) => { sessions.delete(parseCookies(req)[SESSION_COOKIE]); res.setHeader('Set-Cookie', `${SESSION_COOKIE}=; HttpOnly; Path=/; Max-Age=0; SameSite=Strict`); res.json({ success: true }); });
@@ -369,6 +444,20 @@ app.use(requireAuth);
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 app.get('/get-config', (req, res) => { try { res.json(configView(req.query.channel)); } catch (error) { res.status(400).json({ message: error.message }); } });
 app.get('/get-channels', (req, res) => res.json(config.channels));
+app.get('/auth/twitch/start', (req, res) => {
+    if (!config.twitch.clientId || !config.twitch.clientSecret) return res.status(400).send('Сначала укажите Twitch Client ID и Client Secret');
+    const state = crypto.randomBytes(24).toString('hex');
+    oauthStates.set(state, Date.now() + 10 * 60 * 1000);
+    const params = new URLSearchParams({
+        client_id: config.twitch.clientId,
+        redirect_uri: config.twitch.redirectUri,
+        response_type: 'code',
+        scope: config.twitch.oauthScopes.join(' '),
+        state,
+        force_verify: 'true'
+    });
+    res.redirect(`https://id.twitch.tv/oauth2/authorize?${params}`);
+});
 
 app.post('/toggle-global-timer', (req, res) => {
     const channel = normalizeChannel(req.body.channel || config.twitch.channel);
@@ -446,9 +535,23 @@ app.post('/start-custom-spam', async (req, res) => {
     const message = cleanText(req.body.message); if (!message) return res.status(400).json({ message: 'Пустое сообщение' });
     try { await runSpam(req.body.channel, message, int(req.body.count, 1, 1, 50), int(req.body.delayMs, config.globalChatDelayMs, 0, 30000)); res.json({ success: true, message: 'Сообщение отправлено' }); } catch (error) { res.status(409).json({ message: error.message }); }
 });
-app.post('/request-title-update', (req, res) => { client.say(toIrcChannel(req.body.channel), '!settitle'); res.json({ success: true }); });
+app.get('/get-stream-title', async (req, res) => {
+    try {
+        const channel = normalizeChannel(req.query.channel || config.twitch.channel);
+        const body = await helix(`/channels?broadcaster_id=${encodeURIComponent(await twitchUserId(channel))}`);
+        res.json({ title: body?.data?.[0]?.title || 'Без названия' });
+    } catch (error) { res.status(400).json({ message: error.message }); }
+});
 app.post('/request-game-update', (req, res) => { client.say(toIrcChannel(req.body.channel), '!setgame'); res.json({ success: true }); });
-app.post('/send-set-title', (req, res) => { client.say(toIrcChannel(req.body.channel), `!settitle ${cleanText(req.body.titleText, 140)}`); res.json({ success: true }); });
+app.post('/send-set-title', async (req, res) => {
+    const title = cleanText(req.body.titleText, 140);
+    if (!title) return res.status(400).json({ message: 'Название не может быть пустым' });
+    try {
+        const channel = normalizeChannel(req.body.channel || config.twitch.channel);
+        await helix(`/channels?broadcaster_id=${encodeURIComponent(await twitchUserId(channel))}`, { method: 'PATCH', body: JSON.stringify({ title }) });
+        res.json({ success: true, title, message: `Название #${channel} изменено` });
+    } catch (error) { res.status(400).json({ message: error.message }); }
+});
 app.post('/send-set-game', (req, res) => { client.say(toIrcChannel(req.body.channel), `!setgame ${cleanText(req.body.gameText, 80)}`); res.json({ success: true }); });
 
 client.on('message', async (channel, tags, message, self) => {
