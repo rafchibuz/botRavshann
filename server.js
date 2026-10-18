@@ -83,15 +83,8 @@ function migrateConfig() {
     config.twitch ||= {};
     config.twitch.redirectUri ||= 'http://localhost:8080';
     config.twitch.channelAuth ||= {};
-    const requiredScopes = [
-        'chat:read',
-        'chat:edit',
-        'moderator:manage:chat_messages',
-        'channel:manage:broadcast',
-        'channel:manage:polls',
-        'channel:manage:predictions'
-    ];
-    config.twitch.oauthScopes = [...new Set([...(config.twitch.oauthScopes || []), ...requiredScopes])];
+    config.twitch.moderatorLogin = normalizeChannel(config.twitch.moderatorLogin || config.twitch.botUsername);
+    config.twitch.oauthScopes = ['moderator:manage:chat_messages'];
     config.panelPassword ||= 'change-me';
     config.globalChatDelayMs = int(config.globalChatDelayMs, 600, 0, 30000);
     config.globalTimerIntervalSeconds = int(config.globalTimerIntervalSeconds, 600, 10, 86400);
@@ -175,7 +168,9 @@ function configView(channel) {
             appConfigured: Boolean(config.twitch.clientId && config.twitch.clientSecret),
             authorized: Boolean(channelAuth.refreshToken),
             login: channelAuth.login || null,
-            expiresAt: channelAuth.expiresAt || null
+            expiresAt: channelAuth.expiresAt || null,
+            mode: 'moderator',
+            expectedLogin: config.twitch.moderatorLogin
         },
         activity: { cooldownSeconds: config.activity.cooldownSeconds, exactLookupConfigured: Boolean(config.activity.lookupUrl), siteUrl: config.activity.siteUrl }
     };
@@ -350,8 +345,8 @@ async function exchangeAuthorizationCode(code, channel) {
     const validationResponse = await fetch('https://id.twitch.tv/oauth2/validate', { headers: { Authorization: `OAuth ${body.access_token}` } });
     const validation = await validationResponse.json().catch(() => ({}));
     if (!validationResponse.ok) throw new Error(validation.message || 'Не удалось проверить Twitch OAuth');
-    if (normalizeChannel(validation.login) !== key) {
-        throw new Error(`Войдите в Twitch как ${key}, сейчас выбран аккаунт ${validation.login || 'неизвестен'}`);
+    if (normalizeChannel(validation.login) !== config.twitch.moderatorLogin) {
+        throw new Error(`Войдите в Twitch как ${config.twitch.moderatorLogin}, сейчас выбран аккаунт ${validation.login || 'неизвестен'}`);
     }
     config.twitch.channelAuth[key] = {
         accessToken: body.access_token,
@@ -686,59 +681,11 @@ app.get('/get-pinned-message', async (req, res) => {
         });
     } catch (error) { res.status(400).json({ message: error.message }); }
 });
-app.post('/send-set-title', async (req, res) => {
-    const title = cleanText(req.body.titleText, 140);
-    if (!title) return res.status(400).json({ message: 'Название не может быть пустым' });
-    try {
-        const channel = normalizeChannel(req.body.channel || config.twitch.channel);
-        await helix(`/channels?broadcaster_id=${encodeURIComponent(await twitchUserId(channel, channel))}`, { method: 'PATCH', body: JSON.stringify({ title }) }, channel);
-        res.json({ success: true, title, message: `Название #${channel} изменено` });
-    } catch (error) { res.status(400).json({ message: error.message }); }
-});
-app.post('/send-set-game', async (req, res) => {
-    const query = cleanText(req.body.gameText, 80);
-    if (!query) return res.status(400).json({ message: 'Введите название категории' });
-    try {
-        const channel = normalizeChannel(req.body.channel || config.twitch.channel);
-        const search = await helix(`/search/categories?query=${encodeURIComponent(query)}&first=20`, {}, channel);
-        const categories = search?.data || [];
-        const category = categories.find(item => item.name.toLowerCase() === query.toLowerCase()) || categories[0];
-        if (!category) return res.status(404).json({ message: `Категория «${query}» не найдена в Twitch` });
-        await helix(`/channels?broadcaster_id=${encodeURIComponent(await twitchUserId(channel, channel))}`, { method: 'PATCH', body: JSON.stringify({ game_id: category.id }) }, channel);
-        res.json({ success: true, game: category.name, gameId: category.id, message: `Категория #${channel} изменена на «${category.name}»` });
-    } catch (error) { res.status(400).json({ message: error.message }); }
-});
-
-function stringChoices(values, min, max) {
-    const choices = (Array.isArray(values) ? values : []).map(value => cleanText(value, 25)).filter(Boolean);
-    if (choices.length < min || choices.length > max) throw new Error(`Нужно от ${min} до ${max} вариантов`);
-    if (new Set(choices.map(value => value.toLowerCase())).size !== choices.length) throw new Error('Варианты не должны повторяться');
-    return choices;
-}
-
-app.post('/api/polls', async (req, res) => {
-    try {
-        const channel = normalizeChannel(req.body.channel || config.twitch.channel);
-        const title = cleanText(req.body.title, 60);
-        if (!title) return res.status(400).json({ message: 'Введите вопрос опроса' });
-        const choices = stringChoices(req.body.choices, 2, 5).map(title => ({ title }));
-        const duration = int(req.body.duration, 60, 15, 1800);
-        const body = await helix('/polls', { method: 'POST', body: JSON.stringify({ broadcaster_id: await twitchUserId(channel, channel), title, choices, duration }) }, channel);
-        res.status(201).json({ poll: body?.data?.[0], message: `Опрос «${title}» создан` });
-    } catch (error) { res.status(400).json({ message: error.message }); }
-});
-
-app.post('/api/predictions', async (req, res) => {
-    try {
-        const channel = normalizeChannel(req.body.channel || config.twitch.channel);
-        const title = cleanText(req.body.title, 45);
-        if (!title) return res.status(400).json({ message: 'Введите вопрос прогноза' });
-        const outcomes = stringChoices(req.body.outcomes, 2, 10).map(title => ({ title }));
-        const prediction_window = int(req.body.predictionWindow, 60, 30, 1800);
-        const body = await helix('/predictions', { method: 'POST', body: JSON.stringify({ broadcaster_id: await twitchUserId(channel, channel), title, outcomes, prediction_window }) }, channel);
-        res.status(201).json({ prediction: body?.data?.[0], message: `Прогноз «${title}» создан` });
-    } catch (error) { res.status(400).json({ message: error.message }); }
-});
+const ownerOnly = (_req, res) => res.status(403).json({ message: 'Twitch разрешает это действие только владельцу канала' });
+app.post('/send-set-title', ownerOnly);
+app.post('/send-set-game', ownerOnly);
+app.post('/api/polls', ownerOnly);
+app.post('/api/predictions', ownerOnly);
 
 client.on('message', async (channel, tags, message, self) => {
     if (self) { resolveMessageId(channel, tags, message); return; }
