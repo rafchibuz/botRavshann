@@ -1,0 +1,23 @@
+{
+  "twitch": {
+    "channel": "ravshann",
+    "botUsername": "your_bot_login",
+    "oauthToken": "oauth:your_user_access_token",
+    "clientId": "your_twitch_application_client_id"
+  },
+  "channels": ["ravshann", "ravshanbtw"],
+  "panelPassword": "change-this-password",
+  "globalChatDelayMs": 600,
+  "globalTimerIntervalSeconds": 600,
+  "globalTimerEnabled": false,
+  "activity": {
+    "cooldownSeconds": 10,
+    "publicRatingUrl": "https://www.ravshan.tv/api/rating?channel=all&period=1y",
+    "lookupUrl": "",
+    "siteUrl": "https://ravshan.tv",
+    "cacheSeconds": 60
+  },
+  "buttons": [],
+  "channelState": {}
+}
+

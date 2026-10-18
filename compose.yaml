@@ -1,0 +1,13 @@
+services:
+  twitch-bot:
+    build: .
+    container_name: ravshan-twitch-bot
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    volumes:
+      - ./config.json:/app/config.json
+    environment:
+      NODE_ENV: production
+      PORT: 80
+

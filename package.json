@@ -1,0 +1,22 @@
+{
+  "name": "jsbot",
+  "version": "1.0.0",
+  "description": "Twitch moderation bot and web control panel for Ravshan",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js",
+    "test": "node --test"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "tmi.js": "^1.8.5"
+  }
+}
