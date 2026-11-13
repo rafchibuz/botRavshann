@@ -152,8 +152,16 @@ function getState(channel) {
     return config.channelState[key] ||= defaultChannelState();
 }
 
-function quickMessages() {
-    return (config.buttons || []).map(button => ({ id: String(button.id), title: cleanText(button.title || button.id, 80), message: cleanText(button.message) }));
+function quickMessages(channel = config.twitch.channel) {
+    const state = getState(channel);
+    return (config.buttons || []).map(button => {
+        const timer = state.timers.find(item => item.id === String(button.id));
+        return {
+            id: String(button.id),
+            title: cleanText(timer?.title || button.title || button.id, 80),
+            message: cleanText(timer?.message || button.message)
+        };
+    });
 }
 
 function configView(channel) {
@@ -166,7 +174,7 @@ function configView(channel) {
         globalChatDelayMs: config.globalChatDelayMs,
         globalTimerEnabled: state.globalTimerEnabled,
         globalTimerIntervalSeconds: state.globalTimerIntervalSeconds,
-        buttons: quickMessages(),
+        buttons: quickMessages(key),
         timers: state.timers,
         pinnedMessages: state.pinnedMessages,
         customCommands: state.customCommands,
@@ -710,7 +718,8 @@ app.post('/api/pins/:id/send', async (req, res) => {
 app.delete('/api/pins/current', async (req, res) => { try { await unpin(req.query.channel || config.twitch.channel); res.json({ success: true, message: 'Закреп снят' }); } catch (error) { res.status(400).json({ message: error.message }); } });
 
 app.post('/start-spam', async (req, res) => {
-    const target = quickMessages().find(button => button.id === req.body.id); if (!target) return res.status(404).json({ message: 'Кнопка не найдена' });
+    const channel = normalizeChannel(req.body.channel || config.twitch.channel);
+    const target = quickMessages(channel).find(button => button.id === req.body.id); if (!target) return res.status(404).json({ message: 'Кнопка не найдена' });
     try { await runSpam(req.body.channel, target.message, int(req.body.count, 1, 1, 50), config.globalChatDelayMs); res.json({ success: true, message: `«${target.title}» отправлено` }); } catch (error) { res.status(409).json({ message: error.message }); }
 });
 app.post('/start-custom-spam', async (req, res) => {
@@ -786,7 +795,7 @@ client.on('message', async (channel, tags, message, self) => {
         return;
     }
     const aliases = { '!тг': 'tg', '!гта': 'majestic', '!бб': 'betboom', '!фоллоу': 'follow', '!ф': 'follow', '!розыгрыш': 'priora', '!приора': 'priora', '!роз': 'priora', '!общага': 'obshaga', '!отг': 'obshaga', '!инт': 'int' };
-    const target = quickMessages().find(button => button.id === aliases[command]);
+    const target = quickMessages(key).find(button => button.id === aliases[command]);
     if (!target || busyChannels.has(key)) return;
     try { await runSpam(key, mod ? target.message : `@${tags['display-name'] || tags.username}, ${target.message}`, mod ? int(args[1], 5, 1, 50) : 1, config.globalChatDelayMs); } catch (error) { console.error(error.message); }
 });
