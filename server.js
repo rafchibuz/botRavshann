@@ -21,6 +21,8 @@ function loadConfig() {
 let config = loadConfig();
 const sessions = new Map();
 const timerInstances = new Map();
+const fixedTimerInstances = new Map();
+const scheduledSendQueues = new Map();
 const busyChannels = new Set();
 const pendingOutgoing = new Map();
 const activityThrottle = new Map();
@@ -44,6 +46,15 @@ function int(value, fallback, min, max) {
     return Number.isFinite(parsed) ? Math.min(max, Math.max(min, parsed)) : fallback;
 }
 
+const legacyTimerCommands = {
+    tg: '!тг', majestic: '!гта', betboom: '!бб', follow: '!фоллоу',
+    priora: '!розыгрыш', obshaga: '!общага', int: '!инт'
+};
+
+function timerCommand(timer) {
+    return normalizeCommand(timer.command || legacyTimerCommands[String(timer.id || '').toLowerCase()] || timer.title || timer.id);
+}
+
 function saveConfig() {
     const temp = `${configPath}.tmp`;
     fs.writeFileSync(temp, JSON.stringify(config, null, 2), 'utf-8');
@@ -62,6 +73,9 @@ function legacyTimers() {
         id: String(button.id || makeId('timer')),
         title: cleanText(button.title || button.id || 'Таймер', 80),
         message: cleanText(button.message),
+        command: timerCommand(button),
+        scheduleMode: 'rotation',
+        intervalSeconds: 300,
         enabled: Boolean(button.enabled),
         spamCount: int(button.spamCount, 1, 1, 20)
     }));
@@ -124,6 +138,9 @@ function migrateConfig() {
             id: String(timer.id || makeId('timer')),
             title: cleanText(timer.title || 'Таймер', 80),
             message: cleanText(timer.message),
+            command: timerCommand(timer),
+            scheduleMode: timer.scheduleMode === 'fixed' ? 'fixed' : 'rotation',
+            intervalSeconds: int(timer.intervalSeconds, 300, 60, 86400),
             enabled: Boolean(timer.enabled),
             spamCount: int(timer.spamCount, 1, 1, 20)
         })).filter(timer => timer.message);
@@ -154,14 +171,12 @@ function getState(channel) {
 
 function quickMessages(channel = config.twitch.channel) {
     const state = getState(channel);
-    return (config.buttons || []).map(button => {
-        const timer = state.timers.find(item => item.id === String(button.id));
-        return {
-            id: String(button.id),
-            title: cleanText(timer?.title || button.title || button.id, 80),
-            message: cleanText(timer?.message || button.message)
-        };
-    });
+    return state.timers.filter(timer => timer.command && timer.message).map(timer => ({
+        id: timer.id,
+        title: timer.title,
+        message: timer.message,
+        command: timer.command
+    }));
 }
 
 function configView(channel) {
@@ -249,28 +264,68 @@ async function runSpam(channel, message, count, delayMs) {
     } finally { busyChannels.delete(key); }
 }
 
+function queueScheduledSpam(channel, message, count, label) {
+    const key = normalizeChannel(channel);
+    const previous = scheduledSendQueues.get(key) || Promise.resolve();
+    const current = previous.catch(() => {}).then(async () => {
+        while (busyChannels.has(key)) await delay(250);
+        return runSpam(key, message, count, config.globalChatDelayMs);
+    });
+    scheduledSendQueues.set(key, current);
+    current.catch(error => console.error(`[${label} #${key}]`, error.message)).finally(() => {
+        if (scheduledSendQueues.get(key) === current) scheduledSendQueues.delete(key);
+    });
+    return current;
+}
+
 async function sendNext(channel) {
     const key = normalizeChannel(channel);
     const state = getState(key);
-    const active = state.timers.filter(timer => timer.enabled && timer.message);
-    if (!active.length || busyChannels.has(key)) return;
+    const active = state.timers.filter(timer => timer.enabled && timer.scheduleMode !== 'fixed' && timer.message);
+    if (!active.length) return;
     const target = active[state.queueIndex % active.length];
     state.queueIndex = (state.queueIndex + 1) % active.length;
     saveConfig();
-    runSpam(key, target.message, target.spamCount, config.globalChatDelayMs).catch(error => console.error(`[ТАЙМЕР #${key}]`, error.message));
+    queueScheduledSpam(key, target.message, target.spamCount, 'ТАЙМЕР');
+}
+
+function clearFixedTimer(id) {
+    const instance = fixedTimerInstances.get(id);
+    if (!instance) return;
+    clearTimeout(instance.timeout);
+    if (instance.interval) clearInterval(instance.interval);
+    fixedTimerInstances.delete(id);
+}
+
+function scheduleFixedTimer(channel, timer) {
+    const key = `${normalizeChannel(channel)}:${timer.id}`;
+    const intervalMs = int(timer.intervalSeconds, 300, 60, 86400) * 1000;
+    const instance = { timeout: null, interval: null };
+    const fire = () => queueScheduledSpam(channel, timer.message, timer.spamCount, `ФИКС-ТАЙМЕР ${timer.title}`);
+    const remainder = Date.now() % intervalMs;
+    const delayUntilBoundary = remainder === 0 ? intervalMs : intervalMs - remainder;
+    instance.timeout = setTimeout(() => {
+        fire();
+        instance.interval = setInterval(fire, intervalMs);
+    }, delayUntilBoundary);
+    fixedTimerInstances.set(key, instance);
 }
 
 function syncTimer(channel) {
     const key = normalizeChannel(channel);
     if (timerInstances.has(key)) clearInterval(timerInstances.get(key));
     timerInstances.delete(key);
+    for (const id of [...fixedTimerInstances.keys()]) {
+        if (id.startsWith(`${key}:`)) clearFixedTimer(id);
+    }
     const state = getState(key);
     if (state.globalTimerEnabled) timerInstances.set(key, setInterval(() => sendNext(key), state.globalTimerIntervalSeconds * 1000));
+    state.timers.filter(timer => timer.enabled && timer.scheduleMode === 'fixed' && timer.message).forEach(timer => scheduleFixedTimer(key, timer));
 }
 
 function timerStatus(channel) {
     const state = getState(channel);
-    const enabled = state.timers.filter(timer => timer.enabled).map(timer => timer.title);
+    const enabled = state.timers.filter(timer => timer.enabled).map(timer => timer.scheduleMode === 'fixed' ? `${timer.title} (${Math.round(timer.intervalSeconds / 60)} мин)` : timer.title);
     return `[Таймеры | цикл ${state.globalTimerEnabled ? 'вкл' : 'выкл'}] активны: ${enabled.join(', ') || 'нет'}`;
 }
 
@@ -281,6 +336,27 @@ function findTimer(state, token) {
 }
 
 const reservedCommands = new Set(['!актив', '!active', '!пинг', '!ping', '!таймер', '!таймерофф', '!таймероф', '!таймеры']);
+function validateTimerSettings(body, state, existingId = null) {
+    const title = cleanText(body.title || 'Новый таймер', 80);
+    const message = cleanText(body.message);
+    const command = normalizeCommand(body.command || title);
+    if (!message) throw new Error('Введите текст таймера');
+    if (!command) throw new Error('Введите команду, например !сайт');
+    if (reservedCommands.has(command) || config.activity.commands.includes(command)) throw new Error('Эта команда уже используется встроенной функцией');
+    if (state.timers.some(item => item.id !== existingId && item.command === command)) throw new Error('Такая команда таймера уже существует');
+    if (state.customCommands.some(item => item.command === command)) throw new Error('Такая пользовательская команда уже существует');
+    const scheduleMode = body.scheduleMode === 'fixed' ? 'fixed' : 'rotation';
+    return {
+        title,
+        message,
+        command,
+        scheduleMode,
+        intervalSeconds: int(body.intervalSeconds, 300, 60, 86400),
+        enabled: body.enabled === true,
+        spamCount: int(body.spamCount, 1, 1, 20)
+    };
+}
+
 function validateCustomCommand(body, existingId, channel) {
     const command = normalizeCommand(body.command);
     const response = cleanText(body.response);
@@ -289,6 +365,7 @@ function validateCustomCommand(body, existingId, channel) {
     if (!response) throw new Error('Введите текст ответа');
     const state = getState(channel);
     if (state.customCommands.some(item => item.id !== existingId && item.command === command)) throw new Error('Такая команда уже существует');
+    if (state.timers.some(item => item.command === command)) throw new Error('Эта команда уже назначена таймеру');
     return {
         command,
         response,
@@ -571,6 +648,12 @@ app.put('/api/activity-settings', (req, res) => {
     try {
         const commands = [...new Set((Array.isArray(req.body.commands) ? req.body.commands : String(req.body.commands || '').split(',')).map(normalizeCommand).filter(Boolean))].slice(0, 10);
         if (!commands.length) return res.status(400).json({ message: 'Добавьте хотя бы одну команду' });
+        for (const channel of config.channels) {
+            const state = getState(channel);
+            if (state.timers.some(timer => commands.includes(timer.command)) || state.customCommands.some(command => commands.includes(command.command))) {
+                return res.status(400).json({ message: `Одна из команд уже используется в #${channel}` });
+            }
+        }
         const ratingChannel = cleanText(req.body.ratingChannel, 30).toLowerCase();
         const period = cleanText(req.body.period, 20).toLowerCase();
         if (!['all', 'ravshann', 'ravshanbtw'].includes(ratingChannel)) return res.status(400).json({ message: 'Неизвестный канал рейтинга' });
@@ -633,27 +716,28 @@ app.post('/toggle-global-timer', (req, res) => {
 });
 
 app.post('/api/timers', (req, res) => {
-    const state = getState(req.body.channel || config.twitch.channel);
-    const message = cleanText(req.body.message);
-    if (!message) return res.status(400).json({ message: 'Введите текст таймера' });
-    const timer = { id: makeId('timer'), title: cleanText(req.body.title || 'Новый таймер', 80), message, enabled: Boolean(req.body.enabled), spamCount: int(req.body.spamCount, 1, 1, 20) };
-    state.timers.push(timer); saveConfig(); res.status(201).json({ timer });
+    try {
+        const channel = normalizeChannel(req.body.channel || config.twitch.channel);
+        const state = getState(channel);
+        const timer = { id: makeId('timer'), ...validateTimerSettings(req.body, state) };
+        state.timers.push(timer); saveConfig(); syncTimer(channel); res.status(201).json({ timer });
+    } catch (error) { res.status(400).json({ message: error.message }); }
 });
 app.put('/api/timers/:id', (req, res) => {
-    const channel = normalizeChannel(req.body.channel || config.twitch.channel);
-    const state = getState(channel); const timer = state.timers.find(item => item.id === req.params.id);
-    if (!timer) return res.status(404).json({ message: 'Таймер не найден' });
-    if (req.body.title !== undefined) timer.title = cleanText(req.body.title, 80) || timer.title;
-    if (req.body.message !== undefined) { const message = cleanText(req.body.message); if (!message) return res.status(400).json({ message: 'Текст не может быть пустым' }); timer.message = message; }
-    if (req.body.enabled !== undefined) timer.enabled = Boolean(req.body.enabled);
-    if (req.body.spamCount !== undefined) timer.spamCount = int(req.body.spamCount, timer.spamCount, 1, 20);
-    saveConfig(); res.json({ timer, timers: state.timers });
+    try {
+        const channel = normalizeChannel(req.body.channel || config.twitch.channel);
+        const state = getState(channel); const timer = state.timers.find(item => item.id === req.params.id);
+        if (!timer) return res.status(404).json({ message: 'Таймер не найден' });
+        Object.assign(timer, validateTimerSettings({ ...timer, ...req.body }, state, timer.id));
+        saveConfig(); syncTimer(channel); res.json({ timer, timers: state.timers });
+    } catch (error) { res.status(400).json({ message: error.message }); }
 });
 app.delete('/api/timers/:id', (req, res) => {
-    const state = getState(req.query.channel || config.twitch.channel); const before = state.timers.length;
+    const channel = normalizeChannel(req.query.channel || config.twitch.channel);
+    const state = getState(channel); const before = state.timers.length;
     state.timers = state.timers.filter(item => item.id !== req.params.id);
     if (state.timers.length === before) return res.status(404).json({ message: 'Таймер не найден' });
-    state.queueIndex = 0; saveConfig(); res.json({ success: true });
+    state.queueIndex = 0; saveConfig(); syncTimer(channel); res.json({ success: true });
 });
 app.post('/api/timers/:id/send', async (req, res) => {
     const channel = normalizeChannel(req.body.channel || config.twitch.channel); const timer = getState(channel).timers.find(item => item.id === req.params.id);
@@ -774,12 +858,12 @@ client.on('message', async (channel, tags, message, self) => {
     if (config.activity.enabled && config.activity.commands.includes(normalizeCommand(command))) { queueActivityReply(channel, tags); return; }
     const mod = Boolean(tags.mod) || normalizeChannel(tags.username) === key; const state = getState(key);
     if (mod && command === '!таймер') {
-        args.slice(1).forEach(token => { const timer = findTimer(state, token); if (timer) timer.enabled = true; }); saveConfig(); await client.say(channel, timerStatus(key)); return;
+        args.slice(1).forEach(token => { const timer = findTimer(state, token); if (timer) timer.enabled = true; }); saveConfig(); syncTimer(key); await client.say(channel, timerStatus(key)); return;
     }
     if (mod && (command === '!таймерофф' || command === '!таймероф')) {
-        if (['все', 'всё', 'all'].includes(args[1])) { state.timers.forEach(timer => { timer.enabled = false; }); state.globalTimerEnabled = false; syncTimer(key); }
+        if (['все', 'всё', 'all'].includes(args[1])) { state.timers.forEach(timer => { timer.enabled = false; }); state.globalTimerEnabled = false; }
         else args.slice(1).forEach(token => { const timer = findTimer(state, token); if (timer) timer.enabled = false; });
-        saveConfig(); await client.say(channel, timerStatus(key)); return;
+        saveConfig(); syncTimer(key); await client.say(channel, timerStatus(key)); return;
     }
     if (mod && command === '!таймеры') {
         if (['старт', 'запуск'].includes(args[1])) state.globalTimerEnabled = true;
@@ -789,19 +873,31 @@ client.on('message', async (channel, tags, message, self) => {
     if (command === '!пинг' || command === '!ping') {
         const seconds = Math.floor((Date.now() - startTime) / 1000); await client.say(channel, `Понг! 🏓 Аптайм: ${Math.floor(seconds / 3600)}ч ${Math.floor(seconds % 3600 / 60)}м ${seconds % 60}с`); return;
     }
-    const customCommand = state.customCommands.find(item => item.enabled && item.command === normalizeCommand(command));
+    const normalizedChatCommand = normalizeCommand(command);
+    const legacyAliases = { '!тг': 'tg', '!гта': 'majestic', '!бб': 'betboom', '!фоллоу': 'follow', '!ф': 'follow', '!розыгрыш': 'priora', '!приора': 'priora', '!роз': 'priora', '!общага': 'obshaga', '!отг': 'obshaga', '!инт': 'int' };
+    const timerTarget = state.timers.find(timer => timer.command === normalizedChatCommand)
+        || state.timers.find(timer => timer.id === legacyAliases[normalizedChatCommand]);
+    if (timerTarget) {
+        const displayName = tags['display-name'] || tags.username;
+        const response = mod ? timerTarget.message : `@${displayName}, ${timerTarget.message}`;
+        const count = mod ? int(args[1], timerTarget.spamCount, 1, 50) : 1;
+        try { await runSpam(key, response, count, config.globalChatDelayMs); } catch (error) { console.error('[БЫСТРАЯ КОМАНДА]', error.message); }
+        return;
+    }
+    const customCommand = state.customCommands.find(item => item.enabled && item.command === normalizedChatCommand);
     if (customCommand) {
         try { await runCustomCommand(channel, tags, customCommand); } catch (error) { console.error('[КОМАНДА]', error.message); }
         return;
     }
-    const aliases = { '!тг': 'tg', '!гта': 'majestic', '!бб': 'betboom', '!фоллоу': 'follow', '!ф': 'follow', '!розыгрыш': 'priora', '!приора': 'priora', '!роз': 'priora', '!общага': 'obshaga', '!отг': 'obshaga', '!инт': 'int' };
-    const target = quickMessages(key).find(button => button.id === aliases[command]);
-    if (!target || busyChannels.has(key)) return;
-    try { await runSpam(key, mod ? target.message : `@${tags['display-name'] || tags.username}, ${target.message}`, mod ? int(args[1], 5, 1, 50) : 1, config.globalChatDelayMs); } catch (error) { console.error(error.message); }
 });
 
-config.channels.forEach(channel => { if (getState(channel).globalTimerEnabled) syncTimer(channel); });
+config.channels.forEach(syncTimer);
 const server = app.listen(port, '0.0.0.0', () => console.log(`Панель: http://localhost:${port}\nКаналы: ${config.channels.map(channel => `#${channel}`).join(', ')}`));
-function shutdown() { timerInstances.forEach(clearInterval); activityThrottle.forEach(item => item.timer && clearTimeout(item.timer)); server.close(() => process.exit(0)); }
+function shutdown() {
+    timerInstances.forEach(clearInterval);
+    fixedTimerInstances.forEach(instance => { clearTimeout(instance.timeout); if (instance.interval) clearInterval(instance.interval); });
+    activityThrottle.forEach(item => item.timer && clearTimeout(item.timer));
+    server.close(() => process.exit(0));
+}
 process.on('SIGINT', shutdown); process.on('SIGTERM', shutdown);
 module.exports = { app, lookupRating, queueActivityReply, normalizeChannel };
