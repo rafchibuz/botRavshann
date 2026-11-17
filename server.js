@@ -889,6 +889,7 @@ client.on('message', async (channel, tags, message, self) => {
     if (self) { resolveMessageId(channel, tags, message); return; }
     if (!tags.username) return;
     const key = normalizeChannel(channel); const args = message.trim().toLowerCase().split(/\s+/); const command = args[0];
+    if (!command.startsWith('!')) return;
     if (config.activity.enabled && config.activity.commands.includes(normalizeCommand(command))) { queueActivityReply(channel, tags); return; }
     const mod = Boolean(tags.mod) || normalizeChannel(tags.username) === key; const state = getState(key);
     if (mod && command === '!таймер') {
