@@ -51,8 +51,15 @@ const legacyTimerCommands = {
     priora: '!розыгрыш', obshaga: '!общага', int: '!инт'
 };
 
+function timerCommands(timer) {
+    const source = Array.isArray(timer.commands)
+        ? timer.commands
+        : String(timer.command || legacyTimerCommands[String(timer.id || '').toLowerCase()] || timer.title || timer.id).split(',');
+    return [...new Set(source.map(normalizeCommand).filter(Boolean))].slice(0, 10);
+}
+
 function timerCommand(timer) {
-    return normalizeCommand(timer.command || legacyTimerCommands[String(timer.id || '').toLowerCase()] || timer.title || timer.id);
+    return timerCommands(timer)[0] || '';
 }
 
 function saveConfig() {
@@ -74,6 +81,7 @@ function legacyTimers() {
         title: cleanText(button.title || button.id || 'Таймер', 80),
         message: cleanText(button.message),
         command: timerCommand(button),
+        commands: timerCommands(button),
         scheduleMode: 'rotation',
         intervalSeconds: 300,
         enabled: Boolean(button.enabled),
@@ -134,16 +142,32 @@ function migrateConfig() {
                 spamCount: int(old[timer.id]?.spamCount, timer.spamCount, 1, 20)
             }));
         }
-        state.timers = state.timers.map(timer => ({
-            id: String(timer.id || makeId('timer')),
-            title: cleanText(timer.title || 'Таймер', 80),
-            message: cleanText(timer.message),
-            command: timerCommand(timer),
-            scheduleMode: timer.scheduleMode === 'fixed' ? 'fixed' : 'rotation',
-            intervalSeconds: int(timer.intervalSeconds, 300, 60, 86400),
-            enabled: Boolean(timer.enabled),
-            spamCount: int(timer.spamCount, 1, 1, 20)
-        })).filter(timer => timer.message);
+        const usedTimerCommands = new Set();
+        state.timers = state.timers.map(timer => {
+            const id = String(timer.id || makeId('timer'));
+            const commands = timerCommands(timer).map(original => {
+                let command = original;
+                if (usedTimerCommands.has(command)) {
+                    const base = command.replace(/^!/, '') || 'таймер';
+                    let suffix = 2;
+                    while (usedTimerCommands.has(normalizeCommand(`${base}_${suffix}`))) suffix += 1;
+                    command = normalizeCommand(`${base}_${suffix}`);
+                }
+                usedTimerCommands.add(command);
+                return command;
+            });
+            return {
+                id,
+                title: cleanText(timer.title || 'Таймер', 80),
+                message: cleanText(timer.message),
+                command: commands[0],
+                commands,
+                scheduleMode: timer.scheduleMode === 'fixed' ? 'fixed' : 'rotation',
+                intervalSeconds: int(timer.intervalSeconds, 300, 60, 86400),
+                enabled: Boolean(timer.enabled),
+                spamCount: int(timer.spamCount, 1, 1, 20)
+            };
+        }).filter(timer => timer.message);
         state.pinnedMessages = (Array.isArray(state.pinnedMessages) ? state.pinnedMessages : []).map(pin => ({
             id: String(pin.id || makeId('pin')),
             title: cleanText(pin.title || 'Закреп', 80),
@@ -171,11 +195,12 @@ function getState(channel) {
 
 function quickMessages(channel = config.twitch.channel) {
     const state = getState(channel);
-    return state.timers.filter(timer => timer.command && timer.message).map(timer => ({
+    return state.timers.filter(timer => timerCommands(timer).length && timer.message).map(timer => ({
         id: timer.id,
         title: timer.title,
         message: timer.message,
-        command: timer.command
+        command: timerCommand(timer),
+        commands: timerCommands(timer)
     }));
 }
 
@@ -332,24 +357,33 @@ function timerStatus(channel) {
 function findTimer(state, token) {
     const aliases = { 'тг': 'tg', tg: 'tg', 'гта': 'majestic', gta: 'majestic', 'маджестик': 'majestic', majestic: 'majestic', 'бб': 'betboom', bb: 'betboom', 'бетбум': 'betboom', betboom: 'betboom', 'фоллоу': 'follow', 'ф': 'follow', follow: 'follow', 'приора': 'priora', 'розыгрыш': 'priora', 'роз': 'priora', priora: 'priora', 'общага': 'obshaga', 'отг': 'obshaga', obshaga: 'obshaga', 'инт': 'int', int: 'int' };
     const value = String(token || '').toLowerCase();
-    return state.timers.find(timer => timer.id === (aliases[value] || value) || timer.title.toLowerCase() === value);
+    const command = normalizeCommand(value);
+    return state.timers.find(timer => timer.id === (aliases[value] || value) || timer.title.toLowerCase() === value || timerCommands(timer).includes(command));
 }
 
 const reservedCommands = new Set(['!актив', '!active', '!пинг', '!ping', '!таймер', '!таймерофф', '!таймероф', '!таймеры']);
 function validateTimerSettings(body, state, existingId = null) {
     const title = cleanText(body.title || 'Новый таймер', 80);
     const message = cleanText(body.message);
-    const command = normalizeCommand(body.command || title);
+    const commandSource = Array.isArray(body.commands)
+        ? body.commands
+        : String(body.commands || body.command || title).split(',');
+    const commands = [...new Set(commandSource.map(normalizeCommand).filter(Boolean))].slice(0, 10);
     if (!message) throw new Error('Введите текст таймера');
-    if (!command) throw new Error('Введите команду, например !сайт');
-    if (reservedCommands.has(command) || config.activity.commands.includes(command)) throw new Error('Эта команда уже используется встроенной функцией');
-    if (state.timers.some(item => item.id !== existingId && item.command === command)) throw new Error('Такая команда таймера уже существует');
-    if (state.customCommands.some(item => item.command === command)) throw new Error('Такая пользовательская команда уже существует');
+    if (!commands.length) throw new Error('Введите хотя бы одну команду, например !сайт');
+    for (const command of commands) {
+        if (reservedCommands.has(command) || config.activity.commands.includes(command)) throw new Error(`Команда ${command} уже используется встроенной функцией`);
+        const timerConflict = state.timers.find(item => item.id !== existingId && timerCommands(item).includes(command));
+        if (timerConflict) throw new Error(`Команда ${command} уже назначена таймеру «${timerConflict.title}». Укажите другую команду.`);
+        const customConflict = state.customCommands.find(item => item.command === command);
+        if (customConflict) throw new Error(`Команда ${command} уже занята пользовательской командой. Укажите другую.`);
+    }
     const scheduleMode = body.scheduleMode === 'fixed' ? 'fixed' : 'rotation';
     return {
         title,
         message,
-        command,
+        command: commands[0],
+        commands,
         scheduleMode,
         intervalSeconds: int(body.intervalSeconds, 300, 60, 86400),
         enabled: body.enabled === true,
@@ -365,7 +399,7 @@ function validateCustomCommand(body, existingId, channel) {
     if (!response) throw new Error('Введите текст ответа');
     const state = getState(channel);
     if (state.customCommands.some(item => item.id !== existingId && item.command === command)) throw new Error('Такая команда уже существует');
-    if (state.timers.some(item => item.command === command)) throw new Error('Эта команда уже назначена таймеру');
+    if (state.timers.some(item => timerCommands(item).includes(command))) throw new Error('Эта команда уже назначена таймеру');
     return {
         command,
         response,
@@ -650,7 +684,7 @@ app.put('/api/activity-settings', (req, res) => {
         if (!commands.length) return res.status(400).json({ message: 'Добавьте хотя бы одну команду' });
         for (const channel of config.channels) {
             const state = getState(channel);
-            if (state.timers.some(timer => commands.includes(timer.command)) || state.customCommands.some(command => commands.includes(command.command))) {
+            if (state.timers.some(timer => timerCommands(timer).some(command => commands.includes(command))) || state.customCommands.some(command => commands.includes(command.command))) {
                 return res.status(400).json({ message: `Одна из команд уже используется в #${channel}` });
             }
         }
@@ -875,7 +909,7 @@ client.on('message', async (channel, tags, message, self) => {
     }
     const normalizedChatCommand = normalizeCommand(command);
     const legacyAliases = { '!тг': 'tg', '!гта': 'majestic', '!бб': 'betboom', '!фоллоу': 'follow', '!ф': 'follow', '!розыгрыш': 'priora', '!приора': 'priora', '!роз': 'priora', '!общага': 'obshaga', '!отг': 'obshaga', '!инт': 'int' };
-    const timerTarget = state.timers.find(timer => timer.command === normalizedChatCommand)
+    const timerTarget = state.timers.find(timer => timerCommands(timer).includes(normalizedChatCommand))
         || state.timers.find(timer => timer.id === legacyAliases[normalizedChatCommand]);
     if (timerTarget) {
         const displayName = tags['display-name'] || tags.username;
